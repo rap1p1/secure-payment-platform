@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: secure-payment-platform
+  namespace: secure-payment
+  labels:
+    app.kubernetes.io/name: secure-payment-platform
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: secure-payment-platform
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: secure-payment-platform

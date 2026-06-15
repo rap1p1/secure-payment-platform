@@ -1,0 +1,115 @@
+# ============================================================================
+# Secure Payment Platform - Deployment
+# ============================================================================
+# Security highlights:
+# - Image referenced by DIGEST (not tag) — prevents tag mutation attacks
+# - runAsNonRoot + readOnlyRootFilesystem — defense in depth
+# - Dropped all capabilities — minimal privilege
+# - Resource limits — prevent resource abuse
+# ============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secure-payment-platform
+  namespace: secure-payment
+  labels:
+    app.kubernetes.io/name: secure-payment-platform
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: secure-payment-platform
+    app.kubernetes.io/managed-by: argocd
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: secure-payment-platform
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: secure-payment-platform
+        app.kubernetes.io/component: api
+      annotations:
+        # Forces redeployment when image digest changes
+        supply-chain.security/verified: "true"
+    spec:
+      # ----------------------------------------------------------------
+      # Security Context (Pod level)
+      # ----------------------------------------------------------------
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: payment-api
+          # CRITICAL: Use digest reference, NOT tag
+          # This is updated automatically by the CD pipeline after verification
+          # Replace this digest with the actual one after first pipeline run
+          image: ghcr.io/rap1p1/secure-payment-platform@sha256:placeholder-will-be-updated-by-pipeline
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          env:
+            - name: PORT
+              value: "8080"
+
+          # ----------------------------------------------------------------
+          # Security Context (Container level)
+          # ----------------------------------------------------------------
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+
+          # ----------------------------------------------------------------
+          # Resource Management
+          # ----------------------------------------------------------------
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+
+          # ----------------------------------------------------------------
+          # Health Probes
+          # ----------------------------------------------------------------
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+      # ----------------------------------------------------------------
+      # Topology Spread (High Availability)
+      # ----------------------------------------------------------------
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: secure-payment-platform

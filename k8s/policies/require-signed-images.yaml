@@ -1,0 +1,67 @@
+# ============================================================================
+# Kyverno Policy: Require Signed Images
+# ============================================================================
+# Enforces that ALL images in the secure-payment namespace must be signed
+# using Cosign keyless signing via GitHub Actions OIDC.
+#
+# What this prevents:
+# - Deploying images pushed manually by developers (not through CI/CD)
+# - Deploying images from compromised registries
+# - Tag mutation attacks (attacker replaces image behind the same tag)
+#
+# How it works:
+# 1. Kyverno intercepts Pod creation API requests
+# 2. For each container image matching ghcr.io/rap1p1/*:
+#    - Fetches cosign signature from registry
+#    - Verifies signature was issued by GitHub Actions OIDC
+#    - Checks issuer matches GitHub's OIDC provider
+#    - Checks subject matches the specific workflow in this repo
+# 3. If verification fails → Pod creation is REJECTED (403)
+# ============================================================================
+
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-signed-images
+  annotations:
+    policies.kyverno.io/title: Require Signed Images
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Ensures all container images in the secure-payment namespace
+      are signed using Cosign keyless signing via GitHub Actions OIDC.
+      Unsigned or tampered images are blocked from deployment.
+spec:
+  # ENFORCE = block the pod. Use "Audit" for testing first.
+  validationFailureAction: Enforce
+  
+  # Apply to existing resources on policy update
+  background: true
+  
+  webhookTimeoutSeconds: 30
+  
+  rules:
+    - name: verify-image-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - secure-payment
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/rap1p1/*"
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subject: "https://github.com/rap1p1/secure-payment-platform/.github/workflows/*@refs/heads/main"
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
+          # Mutate the image reference to use digest instead of tag
+          # This prevents TOCTOU (time-of-check-time-of-use) attacks
+          mutateDigest: true
+          required: true

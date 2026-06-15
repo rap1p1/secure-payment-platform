@@ -1,0 +1,306 @@
+# ============================================================================
+# SLSA Level 3 Supply Chain Security Pipeline
+# ============================================================================
+# This workflow implements:
+# 1. Build & push Docker image to GHCR
+# 2. Generate SBOM (CycloneDX format) with Syft
+# 3. Sign image keylessly with Cosign + GitHub OIDC (no static secrets!)
+# 4. Attach SBOM as signed attestation
+# 5. Generate SLSA Level 3 provenance (isolated builder)
+# ============================================================================
+
+name: Supply Chain Security Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - '.github/workflows/supply-chain-security.yaml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'app/**'
+  workflow_dispatch: # Allow manual trigger for demos
+
+# ============================================================================
+# CRITICAL: These permissions are required for SLSA Level 3
+# ============================================================================
+permissions:
+  contents: read       # Checkout code
+  packages: write      # Push to GHCR
+  id-token: write      # OIDC token for keyless signing (Sigstore/Fulcio)
+  actions: read        # Required by SLSA provenance generator
+  attestations: write  # Write attestations to registry
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}  # rap1p1/secure-payment-platform
+
+jobs:
+  # ========================================================================
+  # Job 1: Build, Push, Generate SBOM, Sign Image
+  # ========================================================================
+  build-sign-sbom:
+    name: "🔨 Build → Sign → SBOM"
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image-info.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+      
+    steps:
+      # ------------------------------------------------------------------
+      # Step 1: Checkout source code
+      # ------------------------------------------------------------------
+      - name: "📥 Checkout code"
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # Step 2: Setup build tools
+      # ------------------------------------------------------------------
+      - name: "🐳 Setup Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      - name: "🔧 Install Cosign"
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: "📦 Install Syft (SBOM generator)"
+        uses: anchore/sbom-action/download-syft@v0
+
+      # ------------------------------------------------------------------
+      # Step 3: Authenticate to GHCR
+      # ------------------------------------------------------------------
+      - name: "🔐 Login to GitHub Container Registry"
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ------------------------------------------------------------------
+      # Step 4: Extract metadata (tags, labels)
+      # ------------------------------------------------------------------
+      - name: "🏷️ Extract Docker metadata"
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # ------------------------------------------------------------------
+      # Step 5: Build and Push Docker Image
+      # ------------------------------------------------------------------
+      - name: "🏗️ Build and push Docker image"
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.sha }}
+            BUILD_TIME=${{ github.event.head_commit.timestamp }}
+            GIT_COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false  # We generate our own SLSA provenance below
+
+      # ------------------------------------------------------------------
+      # Step 6: Output image reference
+      # ------------------------------------------------------------------
+      - name: "📋 Set image info output"
+        id: image-info
+        run: |
+          echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # Step 7: Sign image with Cosign (Keyless / GitHub OIDC)
+      # This is the magic: no private key stored anywhere!
+      # Cosign gets a short-lived certificate from Sigstore's Fulcio CA
+      # using the GitHub Actions OIDC token as identity proof.
+      # ------------------------------------------------------------------
+      - name: "✍️ Sign image with Cosign (keyless)"
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          echo "🔏 Signing image with keyless Cosign (GitHub OIDC)..."
+          images=""
+          for tag in ${TAGS}; do
+            images+="${tag}@${DIGEST} "
+          done
+          
+          cosign sign --yes ${images}
+          
+          echo "✅ Image signed successfully!"
+          echo "🔍 Verify with: cosign verify ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST} \\"
+          echo "  --certificate-identity-regexp='github.com/rap1p1' \\"
+          echo "  --certificate-oidc-issuer='https://token.actions.githubusercontent.com'"
+
+      # ------------------------------------------------------------------
+      # Step 8: Generate SBOM with Syft (CycloneDX format)
+      # SBOM = Software Bill of Materials
+      # Lists every component, library, and dependency in the image
+      # ------------------------------------------------------------------
+      - name: "📋 Generate SBOM (CycloneDX)"
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "📦 Generating SBOM for image..."
+          syft "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}" \
+            -o cyclonedx-json=sbom.cdx.json \
+            -o spdx-json=sbom.spdx.json
+          
+          echo "📊 SBOM Summary:"
+          echo "  - CycloneDX: sbom.cdx.json ($(wc -c < sbom.cdx.json) bytes)"
+          echo "  - SPDX: sbom.spdx.json ($(wc -c < sbom.spdx.json) bytes)"
+          
+          # Count components
+          echo "  - Components: $(cat sbom.cdx.json | jq '.components | length')"
+
+      # ------------------------------------------------------------------
+      # Step 9: Attach SBOM as signed attestation to the image
+      # This links the SBOM cryptographically to the image digest
+      # ------------------------------------------------------------------
+      - name: "📎 Attach SBOM attestation to image"
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "📎 Attaching SBOM as attestation..."
+          cosign attest --yes \
+            --predicate sbom.cdx.json \
+            --type cyclonedx \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
+          
+          echo "✅ SBOM attestation attached!"
+
+      # ------------------------------------------------------------------
+      # Step 10: Upload SBOM as workflow artifact (for audit/download)
+      # ------------------------------------------------------------------
+      - name: "⬆️ Upload SBOM artifacts"
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-reports
+          path: |
+            sbom.cdx.json
+            sbom.spdx.json
+          retention-days: 90
+
+      # ------------------------------------------------------------------
+      # Step 11: Vulnerability scan with Trivy (bonus security)
+      # ------------------------------------------------------------------
+      - name: "🔍 Scan SBOM for vulnerabilities (Trivy)"
+        if: github.event_name != 'pull_request'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'sbom'
+          scan-ref: 'sbom.cdx.json'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'  # Don't fail build, just report
+
+  # ========================================================================
+  # Job 2: Generate SLSA Level 3 Provenance
+  # ========================================================================
+  # CRITICAL: This MUST be a separate job calling a reusable workflow.
+  # SLSA Level 3 requires provenance generated by an ISOLATED builder
+  # that the developer cannot tamper with. The slsa-github-generator
+  # runs in its own isolated environment.
+  # ========================================================================
+  provenance:
+    name: "📜 SLSA Provenance (Level 3)"
+    needs: [build-sign-sbom]
+    if: github.event_name != 'pull_request'
+    
+    permissions:
+      actions: read
+      id-token: write
+      packages: write
+
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0
+    with:
+      image: ${{ needs.build-sign-sbom.outputs.image }}
+      digest: ${{ needs.build-sign-sbom.outputs.digest }}
+      registry-username: ${{ github.actor }}
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+  # ========================================================================
+  # Job 3: Verify Everything (Post-build verification)
+  # ========================================================================
+  verify:
+    name: "✅ Verify Artifacts"
+    needs: [build-sign-sbom, provenance]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: "🔧 Install Cosign"
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: "🔧 Install SLSA Verifier"
+        uses: slsa-framework/slsa-verifier/actions/installer@v2.7.0
+
+      - name: "🔐 Login to GHCR"
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Verify image signature
+      - name: "✍️ Verify image signature"
+        run: |
+          echo "🔍 Verifying image signature..."
+          cosign verify \
+            "${{ needs.build-sign-sbom.outputs.image }}@${{ needs.build-sign-sbom.outputs.digest }}" \
+            --certificate-identity-regexp="github.com/rap1p1/secure-payment-platform" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            | jq '.[0]'
+          
+          echo "✅ Signature verification PASSED!"
+
+      # Verify SBOM attestation
+      - name: "📋 Verify SBOM attestation"
+        run: |
+          echo "🔍 Verifying SBOM attestation..."
+          cosign verify-attestation \
+            --type cyclonedx \
+            "${{ needs.build-sign-sbom.outputs.image }}@${{ needs.build-sign-sbom.outputs.digest }}" \
+            --certificate-identity-regexp="github.com/rap1p1/secure-payment-platform" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            | jq '.payload' | base64 -d | jq '.predicate.components | length'
+          
+          echo "✅ SBOM attestation verification PASSED!"
+
+      # Verify SLSA provenance
+      - name: "📜 Verify SLSA provenance"
+        run: |
+          echo "🔍 Verifying SLSA Level 3 provenance..."
+          slsa-verifier verify-image \
+            "${{ needs.build-sign-sbom.outputs.image }}@${{ needs.build-sign-sbom.outputs.digest }}" \
+            --source-uri "github.com/rap1p1/secure-payment-platform" \
+            --source-branch "main"
+          
+          echo "✅ SLSA Level 3 provenance verification PASSED!"
+
+      # Summary
+      - name: "📊 Security verification summary"
+        run: |
+          echo "=============================================="
+          echo "🛡️  SUPPLY CHAIN SECURITY VERIFICATION REPORT"
+          echo "=============================================="
+          echo ""
+          echo "Image:      ${{ needs.build-sign-sbom.outputs.image }}"
+          echo "Digest:     ${{ needs.build-sign-sbom.outputs.digest }}"
+          echo ""
+          echo "✅ Image Signature:     VERIFIED (Cosign keyless)"
+          echo "✅ SBOM Attestation:    VERIFIED (CycloneDX)"
+          echo "✅ SLSA Provenance:     VERIFIED (Level 3)"
+          echo ""
+          echo "🔒 All supply chain security checks PASSED!"
+          echo "=============================================="

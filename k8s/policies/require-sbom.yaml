@@ -1,0 +1,59 @@
+# ============================================================================
+# Kyverno Policy: Require SBOM Attestation
+# ============================================================================
+# Enforces that images must have a CycloneDX SBOM attestation attached.
+# This ensures we always know exactly what components are inside our images.
+#
+# Why this matters:
+# - When a new CVE drops (like Log4Shell), you can instantly check
+#   if your running images contain the affected library
+# - Compliance requirement for SOC2, HIPAA, PCI-DSS
+# - Enables automated vulnerability scanning of deployed images
+# ============================================================================
+
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-sbom-attestation
+  annotations:
+    policies.kyverno.io/title: Require SBOM Attestation
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Ensures all container images have a CycloneDX SBOM attestation
+      attached and signed. Blocks images without SBOM from deployment.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  webhookTimeoutSeconds: 30
+
+  rules:
+    - name: verify-sbom-attestation
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - secure-payment
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/rap1p1/*"
+          attestations:
+            - type: "https://cyclonedx.org/bom"
+              attestors:
+                - count: 1
+                  entries:
+                    - keyless:
+                        issuer: "https://token.actions.githubusercontent.com"
+                        subject: "https://github.com/rap1p1/secure-payment-platform/.github/workflows/*@refs/heads/main"
+                        rekor:
+                          url: "https://rekor.sigstore.dev"
+              # Optional: validate SBOM has components (not empty)
+              conditions:
+                - all:
+                    - key: "{{ components }}"
+                      operator: NotEquals
+                      value: ""
+          required: true

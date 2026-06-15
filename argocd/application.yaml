@@ -1,0 +1,43 @@
+# ============================================================================
+# ArgoCD Application: Secure Payment Platform
+# ============================================================================
+# GitOps deployment: ArgoCD watches the k8s/ directory for changes.
+# When the CD pipeline updates the image digest, ArgoCD auto-syncs.
+# ============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: secure-payment-platform
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: secure-payment-platform
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/rap1p1/secure-payment-platform.git
+    targetRevision: main
+    path: k8s/overlays/production
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: secure-payment
+
+  syncPolicy:
+    automated:
+      prune: true        # Remove resources not in Git
+      selfHeal: true     # Revert manual changes on cluster
+      allowEmpty: false   # Don't sync if no resources found
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
